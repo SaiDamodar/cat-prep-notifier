@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""CAT prep math facts notifier — pushes random math questions via ntfy.sh every 30 minutes."""
+"""CAT prep math facts notifier — pushes random math questions via ntfy.sh every 15 minutes."""
 
 import json
 import logging
 import random
+import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -13,7 +13,9 @@ import requests
 # ── Configuration ──────────────────────────────────────────────────────────────
 NTFY_TOPIC = "sai-reminders"
 NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
-INTERVAL_SECONDS = 30 * 60  # 30 minutes
+NTFY_POLL_URL = f"https://ntfy.sh/{NTFY_TOPIC}/json"
+INTERVAL_SECONDS = 15 * 60  # 15 minutes
+POLL_INTERVAL_SECONDS = 10   # check for "askme" every 10 seconds
 
 STATE_FILE = Path(__file__).parent / "state.json"
 LOG_FILE = Path(__file__).parent / "notifier.log"
@@ -58,13 +60,15 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── State ──────────────────────────────────────────────────────────────────────
+_state_lock = threading.Lock()
+
 def load_state():
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {"last_topic": None, "sent": {t: [] for t in TOPICS}}
+    return {"last_topic": None, "sent": {t: [] for t in TOPICS}, "last_message_id": None}
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
@@ -79,7 +83,6 @@ def pick_item(topic_name, state):
         unsent = list(range(len(data)))
     idx = random.choice(unsent)
     state["sent"][topic_name].append(idx)
-    # keep recent list bounded to half the dataset
     max_recent = max(1, len(data) // 2)
     state["sent"][topic_name] = state["sent"][topic_name][-max_recent:]
     return data[idx]
@@ -115,12 +118,10 @@ def build_notification(topic_name, state):
 
     elif topic_name == "primes":
         p = item
-        # alternate between two question styles
         if random.random() < 0.5:
             title = f"{emoji} Is {p} prime?"
             body = f"Answer: Yes — {p} is prime"
         else:
-            # pick a range around a random prime
             idx = PRIMES.index(p)
             lo = (PRIMES[idx - 1] if idx > 0 else 2) + 1
             hi = PRIMES[min(idx + 3, len(PRIMES) - 1)]
@@ -145,23 +146,89 @@ def next_topic(last_topic):
     choices = [t for t in TOPIC_ORDER if t != last_topic]
     return random.choice(choices)
 
+# ── Shared trigger event ───────────────────────────────────────────────────────
+_askme_event = threading.Event()
+
+# ── Listener thread ────────────────────────────────────────────────────────────
+def poll_for_askme(state):
+    """Background thread: polls ntfy for 'askme' messages and sets _askme_event."""
+    while True:
+        try:
+            with _state_lock:
+                since = state.get("last_message_id") or "all"
+
+            params = {"poll": "1", "since": since}
+            resp = requests.get(NTFY_POLL_URL, params=params, timeout=15)
+            resp.raise_for_status()
+
+            last_id = None
+            triggered = False
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if event.get("event") != "message":
+                    continue
+
+                last_id = event.get("id", last_id)
+
+                if event.get("message", "").strip().lower() == "askme":
+                    log.info("Received 'askme' (id=%s) — triggering immediate question", last_id)
+                    triggered = True
+
+            if last_id:
+                with _state_lock:
+                    state["last_message_id"] = last_id
+                    save_state(state)
+
+            if triggered:
+                _askme_event.set()
+
+        except Exception as e:
+            log.warning("Poll error: %s", e)
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
 # ── Main loop ──────────────────────────────────────────────────────────────────
+def send_question(state):
+    topic = next_topic(state.get("last_topic"))
+    title, body = build_notification(topic, state)
+    send_notification(title, body)
+    state["last_topic"] = topic
+    with _state_lock:
+        save_state(state)
+    log.info("Sent [%s] %s | %s", topic, title, body)
+
 def main():
-    log.info("CAT notifier started")
+    log.info("CAT notifier started (interval=%ds, poll=%ds)", INTERVAL_SECONDS, POLL_INTERVAL_SECONDS)
     state = load_state()
 
+    listener = threading.Thread(target=poll_for_askme, args=(state,), daemon=True)
+    listener.start()
+
+    next_scheduled = time.monotonic() + INTERVAL_SECONDS
+
     while True:
-        topic = next_topic(state.get("last_topic"))
+        # wait up to INTERVAL_SECONDS, but wake early if askme arrives
+        remaining = max(0, next_scheduled - time.monotonic())
+        triggered = _askme_event.wait(timeout=remaining)
+
         try:
-            title, body = build_notification(topic, state)
-            send_notification(title, body)
-            state["last_topic"] = topic
-            save_state(state)
-            log.info("Sent [%s] %s | %s", topic, title, body)
+            send_question(state)
         except Exception as e:
             log.error("Failed to send notification: %s", e)
 
-        time.sleep(INTERVAL_SECONDS)
+        if triggered:
+            # askme fired early — keep original schedule, just clear the flag
+            _askme_event.clear()
+        else:
+            # timer expired normally — reset schedule
+            next_scheduled = time.monotonic() + INTERVAL_SECONDS
 
 if __name__ == "__main__":
     main()

@@ -136,7 +136,7 @@ def send_notification(title, body):
     resp = requests.post(
         NTFY_URL,
         data=body.encode("utf-8"),
-        headers={"Title": title},
+        headers={"Title": title.encode("utf-8")},
         timeout=10,
     )
     resp.raise_for_status()

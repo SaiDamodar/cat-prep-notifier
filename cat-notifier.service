@@ -1,0 +1,15 @@
+[Unit]
+Description=CAT Prep Math Facts Notifier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/sai/dev/notifications/notifier.py
+Restart=on-failure
+RestartSec=60
+User=sai
+WorkingDirectory=/home/sai/dev/notifications
+
+[Install]
+WantedBy=default.target

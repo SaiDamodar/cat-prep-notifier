@@ -6,8 +6,10 @@ SERVICE_NAME="cat-notifier"
 SERVICE_FILE="$SCRIPT_DIR/$SERVICE_NAME.service"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 
+echo "==> Creating virtual environment..."
+python3 -m venv "$SCRIPT_DIR/.venv"
 echo "==> Installing dependencies..."
-pip install --user requests
+"$SCRIPT_DIR/.venv/bin/pip" install requests
 
 echo "==> Creating systemd user service directory..."
 mkdir -p "$SYSTEMD_USER_DIR"
